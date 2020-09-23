@@ -1,0 +1,8 @@
+module amqp-wrapper
+
+go 1.14
+
+require (
+	github.com/rs/zerolog v1.20.0 // indirect
+	github.com/streadway/amqp v1.0.0 // indirect
+)
