@@ -1,4 +1,4 @@
-package wrapper
+package amqpwrapper
 
 import (
 	"encoding/json"
