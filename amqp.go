@@ -204,7 +204,7 @@ func (ch *RabbitChannel) reconnect() {
 func (ch *RabbitChannel) reOpenChannel() {
 	for {
 		errorChannel := <-ch.errorChannel
-		if !ch.closed {
+		if !ch.closed && !ch.conn.IsClosed() {
 			log.Error().Msg(fmt.Errorf("RabbitMQ: service tries to reopen channel: %w", errorChannel).Error())
 
 			if err := ch.openChannel(); err != nil {
