@@ -13,7 +13,7 @@ type RabbitChannel struct {
 	exchangeName    string
 	url             string
 	errorConnection chan *amqp.Error
-	ErrorChannel    chan *amqp.Error
+	errorChannel    chan *amqp.Error
 	closed          bool
 	consumers       map[string]messageListener
 }
@@ -26,11 +26,15 @@ func NewRabbitChannel(cfgURL string) (*RabbitChannel, error) {
 	ch.url = cfgURL
 	ch.consumers = make(map[string]messageListener)
 
-	err := ch.connect()
-	if err != nil {
+	if err := ch.connect(); err != nil {
 		return nil, err
 	}
 	go ch.reconnect()
+
+	if err := ch.openChannel(); err != nil {
+		return nil, err
+	}
+	go ch.reOpenChannel()
 
 	return ch, nil
 }
@@ -127,8 +131,6 @@ func (ch *RabbitChannel) SetUpConsumer(routingKey string, callback messageListen
 	go func() {
 		for {
 			select {
-			case err := <-ch.ErrorChannel:
-				log.Error().Msg(fmt.Errorf("RabbitMQ: consumer '%s' has thrown: %w", routingKey, err).Error())
 			case delivery := <-msgChannel:
 				callback(delivery)
 			}
@@ -159,11 +161,16 @@ func (ch *RabbitChannel) connect() error {
 	ch.conn.NotifyClose(ch.errorConnection)
 	log.Info().Msg("RabbitMQ: Connection is established")
 
-	ch.channel, err = conn.Channel()
+	return nil
+}
+
+func (ch *RabbitChannel) openChannel() error {
+	var err error
+	ch.channel, err = ch.conn.Channel()
 	if err != nil {
 		return fmt.Errorf("RabbitMQ: failed to open a channel: %s", err.Error())
 	}
-	ch.channel.NotifyClose(ch.ErrorChannel)
+	ch.channel.NotifyClose(ch.errorChannel)
 	log.Info().Msg("RabbitMQ: Channel is opened")
 
 	err = ch.channel.Qos(3, 0, true)
@@ -179,8 +186,28 @@ func (ch *RabbitChannel) reconnect() {
 		if !ch.closed {
 			log.Error().Msg(fmt.Errorf("RabbitMQ: service tries to reconnect: %w", errorConnection).Error())
 
-			err := ch.connect()
-			if err != nil {
+			if err := ch.connect(); err != nil {
+				log.Error().Msg(err.Error())
+				panic(err)
+			}
+			if err := ch.openChannel(); err != nil {
+				log.Error().Msg(err.Error())
+				panic(err)
+			}
+			ch.recoverConsumers()
+		} else {
+			return
+		}
+	}
+}
+
+func (ch *RabbitChannel) reOpenChannel() {
+	for {
+		errorChannel := <-ch.errorChannel
+		if !ch.closed {
+			log.Error().Msg(fmt.Errorf("RabbitMQ: service tries to reopen channel: %w", errorChannel).Error())
+
+			if err := ch.openChannel(); err != nil {
 				log.Error().Msg(err.Error())
 				panic(err)
 			}
