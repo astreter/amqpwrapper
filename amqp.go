@@ -36,17 +36,22 @@ type consumer struct {
 	version      int
 }
 
-type RabbitMQ struct {
+type Config struct {
 	URL      string
 	Host     string
 	Port     string
 	User     string
 	Password string
 	Vhost    string
+	Debug    bool
 }
 
-func NewRabbitChannel(ctx context.Context, ctxCancel context.CancelFunc, wg *sync.WaitGroup, cfg *RabbitMQ) (*RabbitChannel, error) {
+func NewRabbitChannel(ctx context.Context, ctxCancel context.CancelFunc, wg *sync.WaitGroup, cfg *Config) (*RabbitChannel, error) {
 	ch := new(RabbitChannel)
+
+	if cfg.Debug {
+		logrus.SetLevel(logrus.DebugLevel)
+	}
 
 	url := cfg.URL
 	logrus.Debug("RabbitMQ.URL: ", url)
