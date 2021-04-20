@@ -30,6 +30,10 @@ type RabbitChannel struct {
 
 type messageListener func(delivery amqp.Delivery) error
 
+type ErrRequeue struct {
+	error
+}
+
 type consumer struct {
 	exchangeName string
 	callback     messageListener
@@ -351,7 +355,8 @@ func (ch *RabbitChannel) listenQueue(routingKey string, version int, msgChannel 
 
 			logrus.Debug(fmt.Sprintf("comsumer %s.v%d: delivery recieved", routingKey, version))
 			if err := callback(delivery); err != nil {
-				if err := delivery.Nack(false, false); err != nil {
+				_, requeue := err.(ErrRequeue)
+				if err := delivery.Nack(false, requeue); err != nil {
 					logrus.Error(fmt.Errorf("RabbitMQ: %s: message nacking failed: %w. Consumer is turned off", routingKey, err))
 					ch.ctxCancel()
 				}
