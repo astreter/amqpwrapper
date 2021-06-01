@@ -153,8 +153,9 @@ func (ch *RabbitChannel) Publish(message interface{}, exchangeName, routingKey s
 				if confirm.Ack {
 					return nil
 				}
-			case <-time.After(3 * time.Second):
-				return errors.New("rabbitMQ: failed to publish a message: delivery confirmation is not received")
+			case <-time.After(5 * time.Second):
+				logrus.Error("rabbitMQ: failed to publish a message: delivery confirmation is not received")
+				ch.ctxCancel()
 			}
 		}
 		return nil
