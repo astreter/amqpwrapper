@@ -28,7 +28,7 @@ type RabbitChannel struct {
 	reconnecting    bool
 }
 
-type messageListener func(delivery amqp.Delivery) error
+type MessageListener func(delivery amqp.Delivery) error
 
 type ErrRequeue struct {
 	error
@@ -36,7 +36,7 @@ type ErrRequeue struct {
 
 type consumer struct {
 	exchangeName string
-	callback     messageListener
+	callback     MessageListener
 	version      int
 }
 
@@ -162,7 +162,7 @@ func (ch *RabbitChannel) Publish(message interface{}, exchangeName, routingKey s
 	}
 }
 
-func (ch *RabbitChannel) SetUpConsumer(exchangeName, routingKey string, callback messageListener) error {
+func (ch *RabbitChannel) SetUpConsumer(exchangeName, routingKey string, callback MessageListener) error {
 	q, err := ch.channel.QueueDeclare(
 		routingKey, // name
 		true,       // durable
@@ -312,7 +312,7 @@ func (ch *RabbitChannel) recoverConsumers() error {
 	return nil
 }
 
-func (ch *RabbitChannel) listenQueue(routingKey string, version int, msgChannel <-chan amqp.Delivery, callback messageListener) {
+func (ch *RabbitChannel) listenQueue(routingKey string, version int, msgChannel <-chan amqp.Delivery, callback MessageListener) {
 	type key string
 
 	logrus.Debugf("listener for queue %s.v%d is in action", routingKey, version)
