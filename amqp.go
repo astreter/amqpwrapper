@@ -288,12 +288,12 @@ func (ch *RabbitChannel) reconnect() {
 			logrus.Error(fmt.Errorf("RabbitMQ: service tries to reconnect: %w", errorConnection).Error())
 			if err := ch.connect(); err != nil {
 				logrus.Error(err.Error())
-				panic(err)
+				ch.ctxCancel()
 			}
 
 			err := ch.recoverConsumers()
 			if err != nil {
-				panic(err)
+				ch.ctxCancel()
 			}
 			ch.reconnecting = false
 		} else {
