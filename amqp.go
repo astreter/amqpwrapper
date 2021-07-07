@@ -6,8 +6,8 @@ import (
 	"errors"
 	"fmt"
 	"github.com/astreter/amqpwrapper/helper"
+	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/sirupsen/logrus"
-	"github.com/streadway/amqp"
 	"sync"
 	"time"
 )
@@ -21,7 +21,7 @@ type RabbitChannel struct {
 	conn            *amqp.Connection
 	channel         *amqp.Channel
 	url             string
-	errorConnection chan *amqp.Error
+	errorConnection chan error
 	notifyConfirm   chan amqp.Confirmation
 	closed          bool
 	consumers       map[string]consumer
@@ -50,7 +50,7 @@ type Config struct {
 	Debug    bool
 }
 
-func NewRabbitChannel(ctx context.Context, ctxCancel context.CancelFunc, wg *sync.WaitGroup, cfg *Config) (*RabbitChannel, error) {
+func NewRabbitChannel(parentCtx context.Context, ctxCancel context.CancelFunc, wg *sync.WaitGroup, cfg *Config) (*RabbitChannel, error) {
 	ch := new(RabbitChannel)
 
 	if cfg.Debug {
@@ -68,19 +68,19 @@ func NewRabbitChannel(ctx context.Context, ctxCancel context.CancelFunc, wg *syn
 		logrus.Debug("RabbitMQ.URL: ", url)
 	}
 
+	ch.ctx = context.WithValue(parentCtx, RabbitChannel{}, nil)
+	ch.ctxCancel = ctxCancel
+	ch.waitGroup = wg
+	ch.consumers = make(map[string]consumer)
+	ch.reconnecting = false
 	ch.url = url
+	ch.errorConnection = make(chan error)
 
 	err := ch.connect()
 	if err != nil {
 		return nil, err
 	}
 	go ch.reconnect()
-
-	ch.ctx = ctx
-	ch.ctxCancel = ctxCancel
-	ch.waitGroup = wg
-	ch.consumers = make(map[string]consumer)
-	ch.reconnecting = false
 
 	return ch, nil
 }
@@ -222,15 +222,19 @@ func (ch *RabbitChannel) SetUpConsumer(exchangeName, routingKey string, callback
 	return nil
 }
 
-func (ch *RabbitChannel) Close() error {
+func (ch *RabbitChannel) close() {
+	ch.waitGroup.Add(1)
+	<-ch.ctx.Done()
+	logrus.Debug("Shutting down RabbitMQ client...")
 	ch.closed = true
 	_ = ch.channel.Close()
 	err := ch.conn.Close()
 	if err != nil {
-		return fmt.Errorf("RabbitMQ: failed to close the connection: %w", err)
+		logrus.Errorf("RabbitMQ: failed to close the connection: %w", err)
 	}
-	logrus.Debug("RabbitMQ: Connection is closed")
-	return nil
+	logrus.Info("RabbitMQ: Connection is closed")
+
+	ch.waitGroup.Done()
 }
 
 func (ch *RabbitChannel) IsAlive() bool {
@@ -251,8 +255,6 @@ func (ch *RabbitChannel) connect() error {
 			}
 		} else {
 			ch.conn = conn
-			ch.errorConnection = make(chan *amqp.Error)
-			ch.conn.NotifyClose(ch.errorConnection)
 			logrus.Debug("RabbitMQ: Connection is established")
 			break
 		}
@@ -277,7 +279,51 @@ func (ch *RabbitChannel) connect() error {
 	}
 
 	logrus.Debug("RabbitMQ: Channel is opened")
+	go ch.startNotifyCancelOrClosed()
+	go ch.close()
+
 	return nil
+}
+
+// listens on the channel's cancelled and closed
+func (ch *RabbitChannel) startNotifyCancelOrClosed() {
+	notifyCloseConn := make(chan *amqp.Error)
+	notifyCloseConn = ch.conn.NotifyClose(notifyCloseConn)
+	notifyCloseChan := make(chan *amqp.Error)
+	notifyCloseChan = ch.channel.NotifyClose(notifyCloseChan)
+	notifyCancelChan := make(chan string)
+	notifyCancelChan = ch.channel.NotifyCancel(notifyCancelChan)
+	select {
+	case err := <-notifyCloseConn:
+		logrus.Debug("attempting to reconnect to amqp server after connection close")
+		ch.errorConnection <- err
+	case err := <-notifyCloseChan:
+		// If the connection close is triggered by the Server, a reconnection takes place
+		if err != nil && err.Server {
+			logrus.Debug("attempting to reconnect to amqp server after channel close")
+			ch.errorConnection <- err
+		}
+	case err := <-notifyCancelChan:
+		logrus.Debug("attempting to reconnect to amqp server after cancel")
+		ch.errorConnection <- errors.New(err)
+	}
+
+	// these channels can be closed by amqp
+	select {
+	case <-notifyCloseConn:
+	default:
+		close(notifyCloseConn)
+	}
+	select {
+	case <-notifyCloseChan:
+	default:
+		close(notifyCloseChan)
+	}
+	select {
+	case <-notifyCancelChan:
+	default:
+		close(notifyCancelChan)
+	}
 }
 
 func (ch *RabbitChannel) reconnect() {
