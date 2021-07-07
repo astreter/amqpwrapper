@@ -68,7 +68,7 @@ func NewRabbitChannel(parentCtx context.Context, ctxCancel context.CancelFunc, w
 		logrus.Debug("RabbitMQ.URL: ", url)
 	}
 
-	ch.ctx = context.WithValue(parentCtx, RabbitChannel{}, nil)
+	ch.ctx = context.WithValue(parentCtx, "rabbitMQ channel ctx", nil)
 	ch.ctxCancel = ctxCancel
 	ch.waitGroup = wg
 	ch.consumers = make(map[string]consumer)
@@ -222,19 +222,17 @@ func (ch *RabbitChannel) SetUpConsumer(exchangeName, routingKey string, callback
 	return nil
 }
 
-func (ch *RabbitChannel) close() {
-	ch.waitGroup.Add(1)
-	<-ch.ctx.Done()
-	logrus.Debug("Shutting down RabbitMQ client...")
-	ch.closed = true
-	_ = ch.channel.Close()
-	err := ch.conn.Close()
-	if err != nil {
-		logrus.Errorf("RabbitMQ: failed to close the connection: %w", err)
+func (ch *RabbitChannel) Close() {
+	if ch.IsAlive() {
+		logrus.Debug("Shutting down RabbitMQ client...")
+		ch.closed = true
+		_ = ch.channel.Close()
+		err := ch.conn.Close()
+		if err != nil {
+			logrus.Errorf("RabbitMQ: failed to close the connection: %w", err)
+		}
+		logrus.Info("RabbitMQ: Connection is closed")
 	}
-	logrus.Info("RabbitMQ: Connection is closed")
-
-	ch.waitGroup.Done()
 }
 
 func (ch *RabbitChannel) IsAlive() bool {
@@ -280,7 +278,6 @@ func (ch *RabbitChannel) connect() error {
 
 	logrus.Debug("RabbitMQ: Channel is opened")
 	go ch.startNotifyCancelOrClosed()
-	go ch.close()
 
 	return nil
 }
@@ -295,34 +292,17 @@ func (ch *RabbitChannel) startNotifyCancelOrClosed() {
 	notifyCancelChan = ch.channel.NotifyCancel(notifyCancelChan)
 	select {
 	case err := <-notifyCloseConn:
-		logrus.Debug("attempting to reconnect to amqp server after connection close")
+		logrus.Info("attempting to reconnect to amqp server after connection close")
 		ch.errorConnection <- err
 	case err := <-notifyCloseChan:
 		// If the connection close is triggered by the Server, a reconnection takes place
 		if err != nil && err.Server {
-			logrus.Debug("attempting to reconnect to amqp server after channel close")
+			logrus.Info("attempting to reconnect to amqp server after channel close")
 			ch.errorConnection <- err
 		}
 	case err := <-notifyCancelChan:
-		logrus.Debug("attempting to reconnect to amqp server after cancel")
+		logrus.Info("attempting to reconnect to amqp server after cancel")
 		ch.errorConnection <- errors.New(err)
-	}
-
-	// these channels can be closed by amqp
-	select {
-	case <-notifyCloseConn:
-	default:
-		close(notifyCloseConn)
-	}
-	select {
-	case <-notifyCloseChan:
-	default:
-		close(notifyCloseChan)
-	}
-	select {
-	case <-notifyCancelChan:
-	default:
-		close(notifyCancelChan)
 	}
 }
 
