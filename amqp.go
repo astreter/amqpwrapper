@@ -129,6 +129,7 @@ func (ch *RabbitChannel) Publish(message interface{}, exchangeName, routingKey s
 		return errors.New("rabbitMQ: failed to publish a message: connection is lost")
 	}
 
+	tries := ConnectionTries
 	for {
 		err = ch.channel.Publish(
 			exchangeName, // exchange
@@ -141,7 +142,9 @@ func (ch *RabbitChannel) Publish(message interface{}, exchangeName, routingKey s
 			})
 
 		if err != nil {
-			if err == amqp.ErrClosed {
+			if err == amqp.ErrClosed && tries != 0 {
+				time.Sleep(time.Millisecond * 300)
+				tries -= 1
 				continue
 			}
 			logrus.Error(fmt.Errorf("RabbitMQ: failed to publish a message: %w", err).Error())
