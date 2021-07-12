@@ -289,6 +289,8 @@ func (ch *RabbitChannel) connect() error {
 func (ch *RabbitChannel) startNotifyCancelOrClosed() {
 	notifyCloseConn := make(chan *amqp.Error)
 	notifyCloseConn = ch.conn.NotifyClose(notifyCloseConn)
+	notifyBlockConn := make(chan amqp.Blocking)
+	notifyBlockConn = ch.conn.NotifyBlocked(notifyBlockConn)
 	notifyCloseChan := make(chan *amqp.Error)
 	notifyCloseChan = ch.channel.NotifyClose(notifyCloseChan)
 	notifyCancelChan := make(chan string)
@@ -297,6 +299,9 @@ func (ch *RabbitChannel) startNotifyCancelOrClosed() {
 	case err := <-notifyCloseConn:
 		logrus.Info("attempting to reconnect to amqp server after connection close")
 		ch.errorConnection <- err
+	case block := <-notifyBlockConn:
+		logrus.Errorf("Server hits a memory or disk alarm: %s", block.Reason)
+		ch.ctxCancel()
 	case err := <-notifyCloseChan:
 		// If the connection close is triggered by the Server, a reconnection takes place
 		if err != nil && err.Server {
