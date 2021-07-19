@@ -15,17 +15,18 @@ import (
 const ConnectionTries = 3
 
 type RabbitChannel struct {
-	ctx             context.Context
-	ctxCancel       context.CancelFunc
-	waitGroup       *sync.WaitGroup
-	conn            *amqp.Connection
-	channel         *amqp.Channel
-	url             string
-	errorConnection chan error
-	notifyConfirm   chan amqp.Confirmation
-	closed          bool
-	consumers       map[string]consumer
-	reconnecting    bool
+	ctx              context.Context
+	ctxCancel        context.CancelFunc
+	waitGroup        *sync.WaitGroup
+	conn             *amqp.Connection
+	channel          *amqp.Channel
+	url              string
+	errorConnection  chan error
+	notifyConfirm    chan amqp.Confirmation
+	closed           bool
+	consumers        map[string]consumer
+	reconnecting     bool
+	confirmSendsMode bool
 }
 
 type MessageListener func(delivery amqp.Delivery) error
@@ -41,13 +42,14 @@ type consumer struct {
 }
 
 type Config struct {
-	URL      string
-	Host     string
-	Port     string
-	User     string
-	Password string
-	Vhost    string
-	Debug    bool
+	URL          string
+	Host         string
+	Port         string
+	User         string
+	Password     string
+	Vhost        string
+	Debug        bool
+	ConfirmSends bool
 }
 
 func NewRabbitChannel(parentCtx context.Context, ctxCancel context.CancelFunc, wg *sync.WaitGroup, cfg *Config) (*RabbitChannel, error) {
@@ -75,6 +77,7 @@ func NewRabbitChannel(parentCtx context.Context, ctxCancel context.CancelFunc, w
 	ch.reconnecting = false
 	ch.url = url
 	ch.errorConnection = make(chan error)
+	ch.confirmSendsMode = cfg.ConfirmSends
 
 	err := ch.connect()
 	if err != nil {
@@ -116,7 +119,7 @@ func (ch *RabbitChannel) DefineExchange(exchangeName string, isAlreadyExist bool
 	return nil
 }
 
-func (ch *RabbitChannel) Publish(message interface{}, exchangeName, routingKey string, safeMode bool) error {
+func (ch *RabbitChannel) Publish(message interface{}, exchangeName, routingKey string) error {
 	ch.waitGroup.Add(1)
 	defer ch.waitGroup.Done()
 	body, err := json.Marshal(message)
@@ -150,15 +153,18 @@ func (ch *RabbitChannel) Publish(message interface{}, exchangeName, routingKey s
 			logrus.Error(fmt.Errorf("RabbitMQ: failed to publish a message: %w", err).Error())
 			return err
 		}
-		if safeMode {
+		if ch.confirmSendsMode {
 			select {
 			case confirm := <-ch.notifyConfirm:
-				if confirm.Ack {
-					return nil
+				if !confirm.Ack {
+					err = errors.New("rabbitMQ: failed to publish a message: delivery is not acknowledged")
+					logrus.Error(err)
+					return err
 				}
 			case <-time.After(5 * time.Second):
-				logrus.Error("rabbitMQ: failed to publish a message: delivery confirmation is not received")
-				ch.ctxCancel()
+				err = errors.New("rabbitMQ: failed to publish a message: delivery confirmation is not received")
+				logrus.Error(err)
+				return err
 			}
 		}
 		return nil
@@ -266,14 +272,15 @@ func (ch *RabbitChannel) connect() error {
 		return fmt.Errorf("RabbitMQ: failed to open a channel: %s", err.Error())
 	}
 
-	err = ch.channel.Confirm(false)
-	if err != nil {
-		return fmt.Errorf("RabbitMQ: %s", err.Error())
+	if ch.confirmSendsMode {
+		err = ch.channel.Confirm(false)
+		if err != nil {
+			return fmt.Errorf("RabbitMQ: %s", err.Error())
+		}
+
+		ch.notifyConfirm = make(chan amqp.Confirmation)
+		ch.channel.NotifyPublish(ch.notifyConfirm)
 	}
-
-	ch.notifyConfirm = make(chan amqp.Confirmation)
-	ch.channel.NotifyPublish(ch.notifyConfirm)
-
 	err = ch.channel.Qos(3, 0, true)
 	if err != nil {
 		return fmt.Errorf("RabbitMQ: failed to set QoS of a channel: %s", err.Error())
@@ -390,6 +397,7 @@ func (ch *RabbitChannel) listenQueue(routingKey string, version int, msgChannel 
 
 			logrus.Debug(fmt.Sprintf("comsumer %s.v%d: delivery recieved", routingKey, version))
 			if err := callback(delivery); err != nil {
+				logrus.Error(err)
 				_, requeue := err.(ErrRequeue)
 				if err := delivery.Nack(false, requeue); err != nil {
 					logrus.Error(fmt.Errorf("RabbitMQ: %s: message nacking failed: %w. Consumer is turned off", routingKey, err))
