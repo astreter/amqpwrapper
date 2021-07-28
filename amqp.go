@@ -12,7 +12,10 @@ import (
 	"time"
 )
 
-const ConnectionTries = 3
+const (
+	connectionTries = 3
+	resendTries     = 3
+)
 
 type RabbitChannel struct {
 	ctx              context.Context
@@ -120,8 +123,6 @@ func (ch *RabbitChannel) DefineExchange(exchangeName string, isAlreadyExist bool
 }
 
 func (ch *RabbitChannel) Publish(message interface{}, exchangeName, routingKey string) error {
-	ch.waitGroup.Add(1)
-	defer ch.waitGroup.Done()
 	body, err := json.Marshal(message)
 	if err != nil {
 		logrus.Error(fmt.Errorf("RabbitMQ: failed to encode message: %w", err).Error())
@@ -132,7 +133,7 @@ func (ch *RabbitChannel) Publish(message interface{}, exchangeName, routingKey s
 		return errors.New("rabbitMQ: failed to publish a message: connection is lost")
 	}
 
-	tries := ConnectionTries
+	tries := resendTries
 	for {
 		err = ch.channel.Publish(
 			exchangeName, // exchange
@@ -154,20 +155,28 @@ func (ch *RabbitChannel) Publish(message interface{}, exchangeName, routingKey s
 			return err
 		}
 		if ch.confirmSendsMode {
+			logrus.WithField("queue", routingKey).Debug("waiting for confirmation")
 			select {
 			case confirm := <-ch.notifyConfirm:
 				if !confirm.Ack {
 					err = errors.New("rabbitMQ: failed to publish a message: delivery is not acknowledged")
 					logrus.Error(err)
 					return err
+				} else {
+					logrus.WithField("queue", routingKey).Debugf("message #%d successfully published", confirm.DeliveryTag)
+					return nil
 				}
-			case <-time.After(5 * time.Second):
-				err = errors.New("rabbitMQ: failed to publish a message: delivery confirmation is not received")
-				logrus.Error(err)
-				return err
+			case <-time.After(3 * time.Second):
+				if tries == 0 {
+					err = errors.New("rabbitMQ: failed to publish a message: delivery confirmation is not received")
+					logrus.Error(err)
+					return err
+				}
+				tries -= 1
 			}
+		} else {
+			return nil
 		}
-		return nil
 	}
 }
 
@@ -251,11 +260,11 @@ func (ch *RabbitChannel) IsAlive() bool {
 func (ch *RabbitChannel) connect() error {
 	var err error
 	tries := 0
-	for tries < ConnectionTries {
+	for tries < connectionTries {
 		tries++
 		logrus.Debug("RabbitMQ: try to connect")
 		if conn, err := amqp.Dial(ch.url); err != nil {
-			if tries == ConnectionTries {
+			if tries == connectionTries {
 				return fmt.Errorf("failed to connect to RabbitMQ: %s", err.Error())
 			} else {
 				time.Sleep(time.Second)
@@ -281,7 +290,7 @@ func (ch *RabbitChannel) connect() error {
 		ch.notifyConfirm = make(chan amqp.Confirmation)
 		ch.channel.NotifyPublish(ch.notifyConfirm)
 	}
-	err = ch.channel.Qos(3, 0, true)
+	err = ch.channel.Qos(1, 0, true)
 	if err != nil {
 		return fmt.Errorf("RabbitMQ: failed to set QoS of a channel: %s", err.Error())
 	}
