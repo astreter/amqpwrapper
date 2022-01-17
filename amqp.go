@@ -6,7 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"github.com/Insly/goutils"
-	"github.com/astreter/amqpwrapper/otelamqp"
+	"github.com/astreter/amqpwrapper/v2/otelamqp"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/sirupsen/logrus"
 	"go.opentelemetry.io/otel"
