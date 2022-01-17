@@ -5,9 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/astreter/amqpwrapper/helper"
+	"github.com/Insly/goutils"
+	"github.com/astreter/amqpwrapper/otelamqp"
 	amqp "github.com/rabbitmq/amqp091-go"
 	"github.com/sirupsen/logrus"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 	"sync"
 	"time"
 )
@@ -19,7 +23,7 @@ const (
 
 type RabbitChannel struct {
 	ctx              context.Context
-	ctxCancel        context.CancelFunc
+	cancel           chan bool
 	waitGroup        *sync.WaitGroup
 	conn             *amqp.Connection
 	channel          *amqp.Channel
@@ -30,9 +34,10 @@ type RabbitChannel struct {
 	consumers        map[string]consumer
 	reconnecting     bool
 	confirmSendsMode bool
+	tracer           trace.Tracer
 }
 
-type MessageListener func(delivery amqp.Delivery) error
+type MessageListener func(ctx context.Context, delivery amqp.Delivery) error
 
 type ErrRequeue struct {
 	error
@@ -55,7 +60,12 @@ type Config struct {
 	ConfirmSends bool
 }
 
-func NewRabbitChannel(parentCtx context.Context, ctxCancel context.CancelFunc, wg *sync.WaitGroup, cfg *Config) (*RabbitChannel, error) {
+type Header struct {
+	Key   string
+	Value string
+}
+
+func NewRabbitChannel(parentCtx context.Context, wg *sync.WaitGroup, cfg *Config) (*RabbitChannel, error) {
 	ch := new(RabbitChannel)
 
 	if cfg.Debug {
@@ -74,13 +84,14 @@ func NewRabbitChannel(parentCtx context.Context, ctxCancel context.CancelFunc, w
 	}
 
 	ch.ctx = context.WithValue(parentCtx, "rabbitMQ channel ctx", nil)
-	ch.ctxCancel = ctxCancel
+	ch.cancel = make(chan bool)
 	ch.waitGroup = wg
 	ch.consumers = make(map[string]consumer)
 	ch.reconnecting = false
 	ch.url = url
 	ch.errorConnection = make(chan error)
 	ch.confirmSendsMode = cfg.ConfirmSends
+	ch.tracer = otel.Tracer("amqpwrapper")
 
 	err := ch.connect()
 	if err != nil {
@@ -89,6 +100,10 @@ func NewRabbitChannel(parentCtx context.Context, ctxCancel context.CancelFunc, w
 	go ch.reconnect()
 
 	return ch, nil
+}
+
+func (ch *RabbitChannel) SetTracer(trace trace.Tracer) {
+	ch.tracer = trace
 }
 
 func (ch *RabbitChannel) DefineExchange(exchangeName string, isAlreadyExist bool) error {
@@ -122,28 +137,57 @@ func (ch *RabbitChannel) DefineExchange(exchangeName string, isAlreadyExist bool
 	return nil
 }
 
-func (ch *RabbitChannel) Publish(message interface{}, exchangeName, routingKey string) error {
+func (ch *RabbitChannel) Publish(
+	ctx context.Context,
+	message interface{},
+	exchangeName,
+	routingKey string,
+	headers ...Header,
+) error {
+	headersTable := make(amqp.Table)
+
+	ctx, span := ch.tracer.Start(ctx, "Publish", trace.WithSpanKind(trace.SpanKindProducer))
+	defer span.End()
+
 	body, err := json.Marshal(message)
 	if err != nil {
+		span.RecordError(err)
 		logrus.Error(fmt.Errorf("RabbitMQ: failed to encode message: %w", err).Error())
 		return err
 	}
+
+	span.SetAttributes(attribute.Key("exchange").String(exchangeName))
+	span.SetAttributes(attribute.Key("queue").String(routingKey))
+	span.SetAttributes(attribute.Key("message body").String(string(body)))
 
 	if ch.closed {
 		return errors.New("rabbitMQ: failed to publish a message: connection is lost")
 	}
 
+	if len(headers) > 0 {
+		for _, row := range headers {
+			headersTable[row.Key] = row.Value
+		}
+	}
+
+	msg := amqp.Publishing{
+		Headers:     headersTable,
+		ContentType: "application/json",
+		Body:        body,
+	}
+
+	otel.GetTextMapPropagator().Inject(ctx, otelamqp.NewPublisherMessageCarrier(&msg))
+
 	tries := resendTries
 	for {
+		span.AddEvent("send message to RabbitMQ")
 		err = ch.channel.Publish(
 			exchangeName, // exchange
 			routingKey,   // routing key
 			false,        // mandatory
 			false,        // immediate
-			amqp.Publishing{
-				ContentType: "application/json",
-				Body:        body,
-			})
+			msg,
+		)
 
 		if err != nil {
 			if err == amqp.ErrClosed && tries != 0 {
@@ -151,10 +195,12 @@ func (ch *RabbitChannel) Publish(message interface{}, exchangeName, routingKey s
 				tries -= 1
 				continue
 			}
+			span.RecordError(err)
 			logrus.Error(fmt.Errorf("RabbitMQ: failed to publish a message: %w", err).Error())
 			return err
 		}
 		if ch.confirmSendsMode {
+			span.AddEvent("waiting for confirmation")
 			logrus.WithField("queue", routingKey).Debug("waiting for confirmation")
 			select {
 			case confirm := <-ch.notifyConfirm:
@@ -163,12 +209,15 @@ func (ch *RabbitChannel) Publish(message interface{}, exchangeName, routingKey s
 					logrus.Error(err)
 					return err
 				} else {
-					logrus.WithField("queue", routingKey).Debugf("message #%d successfully published", confirm.DeliveryTag)
+					note := fmt.Sprintf("message #%d successfully published", confirm.DeliveryTag)
+					span.AddEvent(note)
+					logrus.WithField("queue", routingKey).Debug(note)
 					return nil
 				}
 			case <-time.After(3 * time.Second):
 				if tries == 0 {
 					err = errors.New("rabbitMQ: failed to publish a message: delivery confirmation is not received")
+					span.RecordError(err)
 					logrus.Error(err)
 					return err
 				}
@@ -317,7 +366,7 @@ func (ch *RabbitChannel) startNotifyCancelOrClosed() {
 		ch.errorConnection <- err
 	case block := <-notifyBlockConn:
 		logrus.Errorf("Server hits a memory or disk alarm: %s", block.Reason)
-		ch.ctxCancel()
+		ch.cancel <- true
 	case err := <-notifyCloseChan:
 		// If the connection close is triggered by the Server, a reconnection takes place
 		if err != nil && err.Server {
@@ -338,12 +387,12 @@ func (ch *RabbitChannel) reconnect() {
 			logrus.Error(fmt.Errorf("RabbitMQ: service tries to reconnect: %w", errorConnection).Error())
 			if err := ch.connect(); err != nil {
 				logrus.Error(err.Error())
-				ch.ctxCancel()
+				ch.cancel <- true
 			}
 
 			err := ch.recoverConsumers()
 			if err != nil {
-				ch.ctxCancel()
+				ch.cancel <- true
 			}
 			ch.reconnecting = false
 		} else {
@@ -378,24 +427,24 @@ func (ch *RabbitChannel) listenQueue(routingKey string, version int, msgChannel 
 			if !ok {
 				logrus.Debugf("channel for %s.v%d seems to be closed", routingKey, version)
 				time.Sleep(time.Second)
-				if err := helper.Retry(3, time.Second, func() error {
+				if err := goutils.Retry(3, time.Second, func() error {
 					if ch.reconnecting {
 						return errors.New("reconnecting is in progress")
 					}
 					version = ch.consumers[routingKey].version
 					return nil
 				}); err != nil {
-					ch.ctxCancel()
+					ch.cancel <- true
 					return
 				}
 
 				if d, ok, err := ch.channel.Get(routingKey, false); err != nil {
 					logrus.Errorf("queue %s.v%d: %q", routingKey, version, err)
-					ch.ctxCancel()
+					ch.cancel <- true
 				} else if ok {
 					if err := d.Nack(false, true); err != nil {
 						logrus.Error("looks like we have lost a delivery")
-						ch.ctxCancel()
+						ch.cancel <- true
 					}
 				} else {
 					logrus.Debugf("listener %s.v%d is back on track", routingKey, version)
@@ -404,19 +453,35 @@ func (ch *RabbitChannel) listenQueue(routingKey string, version int, msgChannel 
 				return
 			}
 
+			// Extract a span context from message to link.
+			carrier := otelamqp.NewConsumerMessageCarrier(&delivery)
+			parentSpanContext := otel.GetTextMapPropagator().Extract(context.Background(), carrier)
+
+			spanCtx, span := ch.tracer.Start(parentSpanContext, routingKey, trace.WithSpanKind(trace.SpanKindConsumer))
+			span.SetName("AMQP delivery")
+			span.SetAttributes(attribute.Key("exchange").String(delivery.Exchange))
+			span.SetAttributes(attribute.Key("queue").String(routingKey))
+			span.SetAttributes(attribute.Key("delivery payload").String(string(delivery.Body)))
+
 			logrus.Debug(fmt.Sprintf("comsumer %s.v%d: delivery recieved", routingKey, version))
-			if err := callback(delivery); err != nil {
+			if err := callback(spanCtx, delivery); err != nil {
+				span.RecordError(err)
 				logrus.Error(err)
 				_, requeue := err.(ErrRequeue)
+				span.AddEvent("negatively acknowledge the delivery")
 				if err := delivery.Nack(false, requeue); err != nil {
+					span.RecordError(err)
 					logrus.Error(fmt.Errorf("RabbitMQ: %s: message nacking failed: %w. Consumer is turned off", routingKey, err))
-					ch.ctxCancel()
+					ch.cancel <- true
 				}
 			} else {
+				span.AddEvent("acknowledge the delivery")
 				if err := delivery.Ack(false); err != nil {
+					span.RecordError(err)
 					logrus.Error(fmt.Errorf("%s.v%d: acknowledger failed with an error: %w", routingKey, version, err))
 				}
 			}
+			span.End()
 		case <-ctx.Done():
 			logrus.Debugf("listener %s.v%d is going down", routingKey, version)
 			if err := ch.channel.Cancel(routingKey, false); err != nil {
@@ -426,4 +491,9 @@ func (ch *RabbitChannel) listenQueue(routingKey string, version int, msgChannel 
 			return
 		}
 	}
+}
+
+// Cancel signals that connection to RabbitMQ is broken
+func (ch *RabbitChannel) Cancel() <-chan bool {
+	return ch.cancel
 }
