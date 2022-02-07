@@ -3,7 +3,6 @@ package amqpwrapper
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"github.com/Insly/goutils"
 	"github.com/astreter/amqpwrapper/v2/otelamqp"
 	"github.com/pkg/errors"
@@ -155,7 +154,7 @@ func (ch *RabbitChannel) DefineExchange(exchangeName string, isAlreadyExist bool
 		)
 	}
 	if err != nil {
-		return fmt.Errorf("RabbitMQ: failed to declare an exchange: %s", err.Error())
+		return errors.Wrap(err, "RabbitMQ: failed to declare an exchange")
 	}
 
 	logrus.Debug("RabbitMQ: exchange `" + exchangeName + "` is declared")
@@ -176,17 +175,22 @@ func (ch *RabbitChannel) Publish(
 
 	body, err := json.Marshal(message)
 	if err != nil {
+		err = errors.Wrap(err, "RabbitMQ: failed to encode message")
 		span.RecordError(err)
-		logrus.Error(fmt.Errorf("RabbitMQ: failed to encode message: %w", err).Error())
+		logrus.Error(err)
 		return err
 	}
 
-	span.SetAttributes(attribute.Key("exchange").String(exchangeName))
-	span.SetAttributes(attribute.Key("queue").String(routingKey))
-	span.SetAttributes(attribute.Key("message body").String(string(body)))
+	span.SetAttributes(
+		attribute.String("exchange", exchangeName),
+		attribute.String("queue", routingKey),
+		attribute.String("message body", string(body)),
+	)
 
 	if ch.closed {
-		return errors.New("rabbitMQ: failed to publish a message: connection is lost")
+		err = errors.New("rabbitMQ: failed to publish a message: connection is lost")
+		span.RecordError(err)
+		return err
 	}
 
 	if len(headers) > 0 {
@@ -220,23 +224,28 @@ func (ch *RabbitChannel) Publish(
 				tries -= 1
 				continue
 			}
+			err = errors.Wrap(err, "RabbitMQ: failed to publish a message")
 			span.RecordError(err)
-			logrus.Error(fmt.Errorf("RabbitMQ: failed to publish a message: %w", err).Error())
+			logrus.Error(err)
 			return err
 		}
 		if ch.confirmSendsMode {
-			span.AddEvent("waiting for confirmation")
+			span.AddEvent("waiting for confirmation", trace.WithAttributes(attribute.String("queue", routingKey)))
 			logrus.WithField("queue", routingKey).Debug("waiting for confirmation")
 			select {
 			case confirm := <-ch.notifyConfirm:
 				if !confirm.Ack {
 					err = errors.New("rabbitMQ: failed to publish a message: delivery is not acknowledged")
+					span.RecordError(err)
 					logrus.Error(err)
 					return err
 				} else {
-					note := fmt.Sprintf("message #%d successfully published", confirm.DeliveryTag)
-					span.AddEvent(note)
-					logrus.WithField("queue", routingKey).Debug(note)
+					note := "message successfully published"
+					span.AddEvent(note, trace.WithAttributes(
+						attribute.String("queue", routingKey),
+						attribute.Int("delivery tag", int(confirm.DeliveryTag)),
+					))
+					logrus.WithField("queue", routingKey).WithField("delivery tag", confirm.DeliveryTag).Debug(note)
 					return nil
 				}
 			case <-time.After(3 * time.Second):
@@ -324,8 +333,8 @@ func (ch *RabbitChannel) SetUpConsumer(exchangeName, routingKey string, callback
 		nil,                           // arguments
 	)
 	if err != nil {
-		err = fmt.Errorf("RabbitMQ: failed to declare a queue %s: %w", routingKey, err)
-		logrus.Error(err.Error())
+		err = errors.Wrapf(err, "RabbitMQ: failed to declare a queue %s", routingKey)
+		logrus.Error(err)
 		return err
 	}
 
@@ -337,8 +346,8 @@ func (ch *RabbitChannel) SetUpConsumer(exchangeName, routingKey string, callback
 		nil,
 	)
 	if err != nil {
-		err = fmt.Errorf("RabbitMQ: failed to bind a queue %s: %w", routingKey, err)
-		logrus.Error(err.Error())
+		err = errors.Wrapf(err, "RabbitMQ: failed to bind a queue %s", routingKey)
+		logrus.Error(err)
 		return err
 	}
 
@@ -352,8 +361,8 @@ func (ch *RabbitChannel) SetUpConsumer(exchangeName, routingKey string, callback
 		nil,                         // args
 	)
 	if err != nil {
-		err = fmt.Errorf("RabbitMQ: failed to register a consumer %s: %w", q.Name, err)
-		logrus.Error(err.Error())
+		err = errors.Wrapf(err, "RabbitMQ: failed to register a consumer %s", q.Name)
+		logrus.Error(err)
 		return err
 	}
 	var version int
@@ -388,7 +397,7 @@ func (ch *RabbitChannel) Close() {
 		_ = ch.channel.Close()
 		err := ch.conn.Close()
 		if err != nil {
-			logrus.Errorf("RabbitMQ: failed to close the connection: %w", err)
+			logrus.Error(errors.Wrap(err, "RabbitMQ: failed to close the connection"))
 		}
 		logrus.Info("RabbitMQ: Connection is closed")
 	}
@@ -406,7 +415,7 @@ func (ch *RabbitChannel) connect() error {
 		logrus.Debug("RabbitMQ: try to connect")
 		if conn, err := amqp.DialConfig(ch.url, amqp.Config{Heartbeat: ch.heartbeat, Locale: ch.locale}); err != nil {
 			if tries == connectionTries {
-				return fmt.Errorf("failed to connect to RabbitMQ: %s", err.Error())
+				return errors.Wrap(err, "failed to connect to RabbitMQ")
 			} else {
 				time.Sleep(time.Second)
 			}
@@ -419,13 +428,13 @@ func (ch *RabbitChannel) connect() error {
 
 	ch.channel, err = ch.conn.Channel()
 	if err != nil {
-		return fmt.Errorf("RabbitMQ: failed to open a channel: %s", err.Error())
+		return errors.Wrap(err, "RabbitMQ: failed to open a channel")
 	}
 
 	if ch.confirmSendsMode {
 		err = ch.channel.Confirm(false)
 		if err != nil {
-			return fmt.Errorf("RabbitMQ: %s", err.Error())
+			return err
 		}
 
 		ch.notifyConfirm = make(chan amqp.Confirmation)
@@ -433,7 +442,7 @@ func (ch *RabbitChannel) connect() error {
 	}
 	err = ch.channel.Qos(0, 0, true)
 	if err != nil {
-		return fmt.Errorf("RabbitMQ: failed to set QoS of a channel: %s", err.Error())
+		return errors.Wrap(err, "RabbitMQ: failed to set QoS of a channel")
 	}
 
 	logrus.Debug("RabbitMQ: Channel is opened")
@@ -476,7 +485,7 @@ func (ch *RabbitChannel) reconnect() {
 		errorConnection, ok := <-ch.errorConnection
 		if !ch.closed && ok {
 			ch.reconnecting = true
-			logrus.Error(fmt.Errorf("RabbitMQ: service tries to reconnect: %w", errorConnection).Error())
+			logrus.Error(errors.Wrap(errorConnection, "RabbitMQ: service tries to reconnect"))
 			if err := ch.connect(); err != nil {
 				logrus.Error(err.Error())
 				ch.cancel <- true
@@ -588,33 +597,34 @@ func (ch *RabbitChannel) processDelivery(
 	carrier := otelamqp.NewConsumerMessageCarrier(&delivery)
 	parentSpanContext := otel.GetTextMapPropagator().Extract(context.Background(), carrier)
 
-	spanCtx, span := ch.tracer.Start(parentSpanContext, routingKey, trace.WithSpanKind(trace.SpanKindConsumer))
+	ctx, span := ch.tracer.Start(parentSpanContext, routingKey, trace.WithSpanKind(trace.SpanKindConsumer))
 	span.SetName("AMQP delivery")
 	span.SetAttributes(
 		attribute.String("exchange", delivery.Exchange),
 		attribute.String("queue", routingKey),
 		attribute.String("delivery payload", string(delivery.Body)),
 	)
+	defer span.End()
 
-	logrus.Debug(fmt.Sprintf("comsumer %s.v%d: delivery recieved", routingKey, version))
-	if err := callback(spanCtx, delivery); err != nil {
+	logrus.WithField("queue", routingKey).WithField("version", version).Debug("delivery received")
+	if err := callback(ctx, delivery); err != nil {
 		span.RecordError(err)
 		logrus.Error(err)
 		_, requeue := err.(ErrRequeue)
-		span.AddEvent("negatively acknowledge the delivery")
+		span.AddEvent("negatively acknowledge the delivery", trace.WithAttributes(attribute.String("queue", routingKey)))
 		if err := delivery.Nack(false, requeue); err != nil {
+			err = errors.Wrap(err, "RabbitMQ: message nacking failed. Consumer is turned off")
 			span.RecordError(err)
-			logrus.Error(fmt.Errorf("RabbitMQ: %s: message nacking failed: %w. Consumer is turned off", routingKey, err))
+			logrus.WithField("queue", routingKey).Error(err)
 			close(availableThreads)
 			ch.cancel <- true
 		}
 	} else {
-		span.AddEvent("acknowledge the delivery")
 		if err := delivery.Ack(false); err != nil {
 			err = errors.Wrapf(err, "%s.v%d: acknowledger failed with an error", routingKey, version)
 			span.RecordError(err)
 			logrus.Error(err)
 		}
+		span.AddEvent("the delivery acknowledged")
 	}
-	span.End()
 }
