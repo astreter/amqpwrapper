@@ -25,6 +25,7 @@ const (
 
 type RabbitChannel struct {
 	ctx              context.Context
+	mu               sync.Mutex
 	cancel           chan bool
 	waitGroup        *sync.WaitGroup
 	conn             *amqp.Connection
@@ -209,6 +210,17 @@ func (ch *RabbitChannel) Publish(
 
 	tries := resendTries
 	for {
+		if tries == 0 {
+			err = errors.New("RabbitMQ: no many attempts to publish a message")
+			span.RecordError(err)
+			logrus.Error(err)
+			return err
+		}
+		if ch.reconnecting {
+			time.Sleep(time.Millisecond * 300)
+			tries -= 1
+			continue
+		}
 		span.AddEvent("send message to RabbitMQ")
 		err = ch.channel.Publish(
 			exchangeName, // exchange
@@ -323,6 +335,8 @@ func defineConsumerOptions(opts []option) map[string]interface{} {
 }
 
 func (ch *RabbitChannel) SetUpConsumer(exchangeName, routingKey string, callback MessageListener, opts ...option) error {
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
 	options := defineConsumerOptions(opts)
 	q, err := ch.channel.QueueDeclare(
 		routingKey,                    // name
@@ -482,22 +496,27 @@ func (ch *RabbitChannel) startNotifyCancelOrClosed() {
 
 func (ch *RabbitChannel) reconnect() {
 	for {
-		errorConnection, ok := <-ch.errorConnection
-		if !ch.closed && ok {
-			ch.reconnecting = true
-			logrus.Error(errors.Wrap(errorConnection, "RabbitMQ: service tries to reconnect"))
-			if err := ch.connect(); err != nil {
-				logrus.Error(err.Error())
-				ch.cancel <- true
-			}
+		select {
+		case errorConnection, ok := <-ch.errorConnection:
+			if !ch.closed && ok && errorConnection != nil {
+				ch.reconnecting = true
+				logrus.Error(errors.Wrap(errorConnection, "RabbitMQ: service tries to reconnect"))
+				if err := ch.connect(); err != nil {
+					logrus.Error(err.Error())
+					ch.cancel <- true
+					return
+				}
 
-			err := ch.recoverConsumers()
-			if err != nil {
+				err := ch.recoverConsumers()
+				if err != nil {
+					ch.cancel <- true
+					return
+				}
+				ch.reconnecting = false
+			} else {
 				ch.cancel <- true
+				return
 			}
-			ch.reconnecting = false
-		} else {
-			return
 		}
 	}
 }
