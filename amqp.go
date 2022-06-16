@@ -3,7 +3,6 @@ package amqpwrapper
 import (
 	"context"
 	"encoding/json"
-	"github.com/Insly/goutils"
 	"github.com/astreter/amqpwrapper/v2/otelamqp"
 	"github.com/pkg/errors"
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -25,7 +24,7 @@ const (
 
 type RabbitChannel struct {
 	ctx              context.Context
-	mu               sync.Mutex
+	mu               sync.RWMutex
 	cancel           chan bool
 	waitGroup        *sync.WaitGroup
 	conn             *amqp.Connection
@@ -36,6 +35,7 @@ type RabbitChannel struct {
 	closed           bool
 	consumers        map[string]consumer
 	reconnecting     bool
+	reconnectMutex   sync.RWMutex
 	confirmSendsMode bool
 	tracer           trace.Tracer
 	heartbeat        time.Duration
@@ -211,15 +211,14 @@ func (ch *RabbitChannel) Publish(
 	tries := resendTries
 	for {
 		if tries == 0 {
-			err = errors.New("RabbitMQ: no many attempts to publish a message")
+			err = errors.New("RabbitMQ: too many attempts to publish a message")
 			span.RecordError(err)
 			logrus.Error(err)
 			return err
 		}
 		if ch.reconnecting {
-			time.Sleep(time.Millisecond * 300)
-			tries -= 1
-			continue
+			ch.reconnectMutex.RLock()
+			ch.reconnectMutex.RUnlock()
 		}
 		span.AddEvent("send message to RabbitMQ")
 		err = ch.channel.Publish(
@@ -335,8 +334,6 @@ func defineConsumerOptions(opts []option) map[string]interface{} {
 }
 
 func (ch *RabbitChannel) SetUpConsumer(exchangeName, routingKey string, callback MessageListener, opts ...option) error {
-	ch.mu.Lock()
-	defer ch.mu.Unlock()
 	options := defineConsumerOptions(opts)
 	q, err := ch.channel.QueueDeclare(
 		routingKey,                    // name
@@ -379,6 +376,10 @@ func (ch *RabbitChannel) SetUpConsumer(exchangeName, routingKey string, callback
 		logrus.Error(err)
 		return err
 	}
+
+	ch.mu.Lock()
+	defer ch.mu.Unlock()
+
 	var version int
 	if c, ok := ch.consumers[routingKey]; !ok {
 		version = 1
@@ -499,6 +500,10 @@ func (ch *RabbitChannel) reconnect() {
 		select {
 		case errorConnection, ok := <-ch.errorConnection:
 			if !ch.closed && ok && errorConnection != nil {
+				if ch.reconnecting {
+					continue
+				}
+				ch.reconnectMutex.Lock()
 				ch.reconnecting = true
 				logrus.Error(errors.Wrap(errorConnection, "RabbitMQ: service tries to reconnect"))
 				if err := ch.connect(); err != nil {
@@ -513,6 +518,7 @@ func (ch *RabbitChannel) reconnect() {
 					return
 				}
 				ch.reconnecting = false
+				ch.reconnectMutex.Unlock()
 			} else {
 				ch.cancel <- true
 				return
@@ -583,18 +589,12 @@ func (ch *RabbitChannel) processDelivery(
 	}()
 	if !ok {
 		logrus.Debugf("channel for %s.v%d seems to be closed", routingKey, version)
-		time.Sleep(time.Second)
-		if err := goutils.Retry(connectionTries, time.Second, func() error {
-			if ch.reconnecting {
-				return errors.New("reconnecting is in progress")
-			}
-			version = ch.consumers[routingKey].version
-			return nil
-		}); err != nil {
-			close(availableThreads)
-			ch.cancel <- true
-			return
-		}
+		ch.reconnectMutex.RLock()
+		defer ch.reconnectMutex.RUnlock()
+
+		ch.mu.RLock()
+		version = ch.consumers[routingKey].version
+		ch.mu.RUnlock()
 
 		if d, ok, err := ch.channel.Get(routingKey, false); err != nil {
 			logrus.Errorf("queue %s.v%d: %q", routingKey, version, err)
@@ -605,10 +605,9 @@ func (ch *RabbitChannel) processDelivery(
 				close(availableThreads)
 				ch.cancel <- true
 			}
-		} else {
-			logrus.Debugf("listener %s.v%d is back on track", routingKey, version)
 		}
 
+		logrus.Debugf("listener %s.v%d is back on track", routingKey, version)
 		return
 	}
 
