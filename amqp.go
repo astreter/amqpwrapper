@@ -162,12 +162,32 @@ func (ch *RabbitChannel) DefineExchange(exchangeName string, isAlreadyExist bool
 	return nil
 }
 
+func (ch *RabbitChannel) RPC(
+	ctx context.Context,
+	requestID string,
+	message interface{},
+	exchangeName, routingKey, replyTo string,
+	headers ...Header,
+) error {
+	return ch.publish(ctx, &requestID, message, exchangeName, routingKey, &replyTo, headers)
+}
+
 func (ch *RabbitChannel) Publish(
 	ctx context.Context,
 	message interface{},
-	exchangeName,
-	routingKey string,
+	exchangeName, routingKey string,
 	headers ...Header,
+) error {
+	return ch.publish(ctx, nil, message, exchangeName, routingKey, nil, headers)
+}
+
+func (ch *RabbitChannel) publish(
+	ctx context.Context,
+	correlationId *string,
+	message interface{},
+	exchangeName, routingKey string,
+	replyTo *string,
+	headers []Header,
 ) error {
 	headersTable := make(amqp.Table)
 
@@ -204,6 +224,14 @@ func (ch *RabbitChannel) Publish(
 		Headers:     headersTable,
 		ContentType: "application/json",
 		Body:        body,
+	}
+
+	if correlationId != nil {
+		msg.CorrelationId = *correlationId
+	}
+
+	if replyTo != nil {
+		msg.ReplyTo = *replyTo
 	}
 
 	otel.GetTextMapPropagator().Inject(ctx, otelamqp.NewPublisherMessageCarrier(&msg))
@@ -252,10 +280,12 @@ func (ch *RabbitChannel) Publish(
 					return err
 				} else {
 					note := "message successfully published"
-					span.AddEvent(note, trace.WithAttributes(
-						attribute.String("queue", routingKey),
-						attribute.Int("delivery tag", int(confirm.DeliveryTag)),
-					))
+					span.AddEvent(
+						note, trace.WithAttributes(
+							attribute.String("queue", routingKey),
+							attribute.Int("delivery tag", int(confirm.DeliveryTag)),
+						),
+					)
 					logrus.WithField("queue", routingKey).WithField("delivery tag", confirm.DeliveryTag).Debug(note)
 					return nil
 				}
@@ -333,7 +363,9 @@ func defineConsumerOptions(opts []option) map[string]interface{} {
 	return options
 }
 
-func (ch *RabbitChannel) SetUpConsumer(exchangeName, routingKey string, callback MessageListener, opts ...option) error {
+func (ch *RabbitChannel) SetUpConsumer(
+	exchangeName, routingKey string, callback MessageListener, opts ...option,
+) error {
 	options := defineConsumerOptions(opts)
 	q, err := ch.channel.QueueDeclare(
 		routingKey,                    // name
@@ -561,14 +593,22 @@ func (ch *RabbitChannel) listenQueue(
 			}
 			go ch.processDelivery(delivery, ok, routingKey, version, callback, availableThreads)
 		case <-ctx.Done():
-			logrus.Debugf("listener %s.v%d is going down", routingKey, version)
-			if err := ch.channel.Cancel(routingKey, false); err != nil {
-				logrus.Errorf("cancel of %s.v%d failed: %q", routingKey, version, err)
-			}
-
+			_ = ch.ShutDownConsumer(routingKey)
 			return
 		}
 	}
+}
+
+func (ch *RabbitChannel) ShutDownConsumer(routingKey string) error {
+	logrus.Debugf("listener %s is going down", routingKey)
+	if err := ch.channel.Cancel(routingKey, false); err != nil {
+		logrus.Errorf("cancel of %s failed: %q", routingKey, err)
+		return err
+	}
+
+	delete(ch.consumers, routingKey)
+
+	return nil
 }
 
 // Cancel signals that connection to RabbitMQ is broken
@@ -626,10 +666,15 @@ func (ch *RabbitChannel) processDelivery(
 
 	logrus.WithField("queue", routingKey).WithField("version", version).Debug("delivery received")
 	if err := callback(ctx, delivery); err != nil {
-		span.RecordError(err)
-		logrus.Error(err)
-		_, requeue := err.(ErrRequeue)
-		span.AddEvent("negatively acknowledge the delivery", trace.WithAttributes(attribute.String("queue", routingKey)))
+		var errRequeue ErrRequeue
+		requeue := errors.Is(err, &errRequeue)
+		if !requeue {
+			span.RecordError(err)
+			logrus.Error(err)
+			span.AddEvent(
+				"negatively acknowledge the delivery", trace.WithAttributes(attribute.String("queue", routingKey)),
+			)
+		}
 		if err := delivery.Nack(false, requeue); err != nil {
 			err = errors.Wrap(err, "RabbitMQ: message nacking failed. Consumer is turned off")
 			span.RecordError(err)
