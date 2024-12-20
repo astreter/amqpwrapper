@@ -32,6 +32,7 @@ type RabbitChannel struct {
 	url              string
 	errorConnection  chan error
 	notifyConfirm    chan amqp.Confirmation
+	notifyReturn     chan amqp.Return
 	closed           bool
 	consumers        map[string]consumer
 	reconnecting     bool
@@ -47,6 +48,8 @@ type MessageListener func(ctx context.Context, delivery amqp.Delivery) error
 type ErrRequeue struct {
 	error
 }
+
+var ErrNoRoute = errors.New("route is not found")
 
 type consumer struct {
 	exchangeName     string
@@ -169,7 +172,9 @@ func (ch *RabbitChannel) RPC(
 	exchangeName, routingKey, replyTo string,
 	headers ...Header,
 ) error {
-	return ch.publish(ctx, &requestID, message, exchangeName, routingKey, &replyTo, headers)
+	return ch.publish(
+		ctx, &requestID, message, exchangeName, routingKey, &replyTo, headers, WithOptionMandatory(true),
+	)
 }
 
 func (ch *RabbitChannel) Publish(
@@ -188,8 +193,10 @@ func (ch *RabbitChannel) publish(
 	exchangeName, routingKey string,
 	replyTo *string,
 	headers []Header,
+	opts ...option,
 ) error {
 	headersTable := make(amqp.Table)
+	options := defineConsumerOptions(opts)
 
 	ctx, span := ch.tracer.Start(ctx, "Publish", trace.WithSpanKind(trace.SpanKindProducer))
 	defer span.End()
@@ -250,10 +257,10 @@ func (ch *RabbitChannel) publish(
 		}
 		span.AddEvent("send message to RabbitMQ")
 		err = ch.channel.Publish(
-			exchangeName, // exchange
-			routingKey,   // routing key
-			false,        // mandatory
-			false,        // immediate
+			exchangeName,                // exchange
+			routingKey,                  // routing key
+			options["mandatory"].(bool), // check if a queue for the routing key actually exists
+			options["immediate"].(bool), // check if a target queue has any consumers
 			msg,
 		)
 
@@ -289,6 +296,11 @@ func (ch *RabbitChannel) publish(
 					logrus.WithField("queue", routingKey).WithField("delivery tag", confirm.DeliveryTag).Debug(note)
 					return nil
 				}
+			case ret := <-ch.notifyReturn:
+				err = errors.Errorf("rabbitMQ: failed to publish a message: %s", ret.ReplyText)
+				span.RecordError(err)
+				logrus.WithField("queue", routingKey).Error(ret.ReplyText)
+				return ErrNoRoute
 			case <-time.After(3 * time.Second):
 				if tries == 0 {
 					err = errors.New("rabbitMQ: failed to publish a message: delivery confirmation is not received")
@@ -346,6 +358,20 @@ func WithOptionAutoAck(flag bool) option {
 	}
 }
 
+func WithOptionMandatory(flag bool) option {
+	return option{
+		Name:  "mandatory",
+		Value: flag,
+	}
+}
+
+func WithOptionImmediate(flag bool) option {
+	return option{
+		Name:  "immediate",
+		Value: flag,
+	}
+}
+
 func defineConsumerOptions(opts []option) map[string]interface{} {
 	var options = map[string]interface{}{
 		"durable":     true,
@@ -354,6 +380,8 @@ func defineConsumerOptions(opts []option) map[string]interface{} {
 		"no-wait":     false,
 		"auto-ack":    false,
 		"threads":     defaultThreadsCount,
+		"mandatory":   false,
+		"immediate":   false,
 	}
 
 	for _, opt := range opts {
@@ -486,6 +514,9 @@ func (ch *RabbitChannel) connect() error {
 
 		ch.notifyConfirm = make(chan amqp.Confirmation)
 		ch.channel.NotifyPublish(ch.notifyConfirm)
+
+		ch.notifyReturn = make(chan amqp.Return)
+		ch.channel.NotifyReturn(ch.notifyReturn)
 	}
 	err = ch.channel.Qos(0, 0, true)
 	if err != nil {
