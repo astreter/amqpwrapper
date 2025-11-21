@@ -3,6 +3,9 @@ package amqpwrapper
 import (
 	"context"
 	"encoding/json"
+	"sync"
+	"time"
+
 	"github.com/astreter/amqpwrapper/v2/otelamqp"
 	"github.com/pkg/errors"
 	amqp "github.com/rabbitmq/amqp091-go"
@@ -10,8 +13,6 @@ import (
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/trace"
-	"sync"
-	"time"
 )
 
 const (
@@ -637,7 +638,9 @@ func (ch *RabbitChannel) ShutDownConsumer(routingKey string) error {
 		return err
 	}
 
+	ch.mu.Lock()
 	delete(ch.consumers, routingKey)
+	ch.mu.Unlock()
 
 	return nil
 }
